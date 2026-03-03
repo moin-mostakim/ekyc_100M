@@ -60,6 +60,7 @@ def _worker_insert(args):
 
     cnxn = pymysql.connect(**db_config)
     cur = cnxn.cursor()
+    cur.execute("SET SESSION innodb_lock_wait_timeout=300")
 
     try:
         for batch_start in range(start_id, end_id, batch_size):
