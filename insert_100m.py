@@ -5,7 +5,7 @@ Logs to insert_log.txt and stdout.
 """
 
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 LOG_FILE = "insert_log.txt"
@@ -143,7 +143,7 @@ def run_parallel(start_id: int, end_id: int, limit: int):
     start_time = datetime.now()
     done = 0
 
-    with ProcessPoolExecutor(max_workers=len(chunks)) as ex:
+    with ThreadPoolExecutor(max_workers=len(chunks)) as ex:
         futures = {ex.submit(_worker_insert, c): c[2] for c in chunks}
         for fut in as_completed(futures):
             wid, rows, elapsed = fut.result()
