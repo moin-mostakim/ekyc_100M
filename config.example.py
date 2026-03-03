@@ -12,4 +12,5 @@ DB_CONFIG = {
 
 TOTAL_RECORDS = 100_000_000
 BATCH_SIZE = 5_000
+NUM_WORKERS = 8  # Parallel workers; increase for faster insert (e.g. 16, 32)
 VALID_NID_LENGTHS = (10, 13, 17)
