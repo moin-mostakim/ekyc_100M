@@ -37,6 +37,8 @@ from config import (
     VALID_NID_LENGTHS,
 )
 
+PARTITION_SIZE = 5_000_000  # user_info, contact_details RANGE partition size
+
 
 def gen_nid(eid: int) -> str:
     """Generate unique NID per eid, 10/13/17 digits. id_type=1 (NID) requires unique id_no."""
@@ -53,9 +55,22 @@ def gen_email(eid: int) -> str:
     return f"user{eid}@ekyc{(eid % 10000)}.bd"
 
 
+def _get_partition_ranges(worker_id: int, num_workers: int, global_start: int, global_end: int):
+    """Assign each worker to disjoint partitions. Worker w gets partition indices w, w+N, w+2N, ..."""
+    ranges = []
+    for p in range(worker_id, 20, num_workers):
+        lo = p * PARTITION_SIZE + 1
+        hi = (p + 1) * PARTITION_SIZE
+        lo = max(lo, global_start)
+        hi = min(hi, global_end)
+        if lo < hi:
+            ranges.append((lo, hi))
+    return ranges
+
+
 def _worker_insert(args):
-    """Worker: insert range [start_id, end_id). Returns (worker_id, rows, elapsed_sec)."""
-    start_id, end_id, worker_id, db_config, batch_size = args
+    """Worker: insert partition-aligned ranges. Returns (worker_id, rows, elapsed_sec)."""
+    ranges, worker_id, db_config, batch_size = args
     start_time = datetime.now()
     rows_done = 0
 
@@ -65,47 +80,48 @@ def _worker_insert(args):
 
     max_retries = 5
     try:
-        for batch_start in range(start_id, end_id, batch_size):
-            batch_end = min(batch_start + batch_size, end_id)
-            ids = list(range(batch_start, batch_end))
+        for start_id, end_id in ranges:
+            for batch_start in range(start_id, end_id, batch_size):
+                batch_end = min(batch_start + batch_size, end_id)
+                ids = list(range(batch_start, batch_end))
 
-            esignkyc_rows = []
-            user_info_rows = []
-            contact_rows = []
+                esignkyc_rows = []
+                user_info_rows = []
+                contact_rows = []
 
-            for eid in ids:
-                nid = gen_nid(eid)
-                phone = gen_phone(eid)
-                email = gen_email(eid)
-                contact_rows.append((eid * 2 - 1, eid, 1, email))
-                contact_rows.append((eid * 2, eid, 2, phone))
-                esignkyc_rows.append((eid, f"User {eid}", 1, nid))
-                user_info_rows.append((eid, eid, 1, 1, nid, f"user_{eid}"))
+                for eid in ids:
+                    nid = gen_nid(eid)
+                    phone = gen_phone(eid)
+                    email = gen_email(eid)
+                    contact_rows.append((eid * 2 - 1, eid, 1, email))
+                    contact_rows.append((eid * 2, eid, 2, phone))
+                    esignkyc_rows.append((eid, f"User {eid}", 1, nid))
+                    user_info_rows.append((eid, eid, 1, 1, nid, f"user_{eid}"))
 
-            for attempt in range(max_retries):
-                try:
-                    cur.executemany(
-                        "INSERT IGNORE INTO esignkyc (id, name, id_type, id_no) VALUES (%s,%s,%s,%s)",
-                        esignkyc_rows,
-                    )
-                    cur.executemany(
-                        "INSERT IGNORE INTO user_info (id, esign_id, emp_id, org_id, nid, user_name) VALUES (%s,%s,%s,%s,%s,%s)",
-                        user_info_rows,
-                    )
-                    cur.executemany(
-                        "INSERT IGNORE INTO contact_details (id, user_id, contact_type, info) VALUES (%s,%s,%s,%s)",
-                        contact_rows,
-                    )
-                    cnxn.commit()
-                    rows_done += len(ids)
-                    break
-                except pymysql.err.OperationalError as e:
-                    if e.args[0] in (1213, 1205):  # Deadlock, Lock wait timeout
-                        cnxn.rollback()
-                        if attempt < max_retries - 1:
-                            time.sleep(0.5 * (attempt + 1))
-                        else:
-                            raise
+                for attempt in range(max_retries):
+                    try:
+                        cur.executemany(
+                            "INSERT IGNORE INTO esignkyc (id, name, id_type, id_no) VALUES (%s,%s,%s,%s)",
+                            esignkyc_rows,
+                        )
+                        cur.executemany(
+                            "INSERT IGNORE INTO user_info (id, esign_id, emp_id, org_id, nid, user_name) VALUES (%s,%s,%s,%s,%s,%s)",
+                            user_info_rows,
+                        )
+                        cur.executemany(
+                            "INSERT IGNORE INTO contact_details (id, user_id, contact_type, info) VALUES (%s,%s,%s,%s)",
+                            contact_rows,
+                        )
+                        cnxn.commit()
+                        rows_done += len(ids)
+                        break
+                    except pymysql.err.OperationalError as e:
+                        if e.args[0] in (1213, 1205):
+                            cnxn.rollback()
+                            if attempt < max_retries - 1:
+                                time.sleep(0.5 * (attempt + 1))
+                            else:
+                                raise
 
     finally:
         cur.close()
@@ -131,38 +147,36 @@ def get_resume_start_id(cnxn) -> int:
 
 
 def run_parallel(start_id: int, end_id: int, limit: int):
-    """Run parallel insert from start_id to min(end_id, limit)."""
+    """Run partition-aligned parallel insert. Each worker gets disjoint partitions."""
     end_id = min(end_id, limit + 1)
     total = end_id - start_id
     if total <= 0:
         log("Nothing to insert (already complete).")
         return
 
-    chunk = max(1, (end_id - start_id) // NUM_WORKERS)
     chunks = []
-    s = start_id
-    for i in range(NUM_WORKERS):
-        e = min(s + chunk, end_id)
-        if s < e:
-            chunks.append((s, e, i, DB_CONFIG, BATCH_SIZE))
-        s = e
+    for w in range(NUM_WORKERS):
+        ranges = _get_partition_ranges(w, NUM_WORKERS, start_id, end_id)
+        if ranges:
+            chunks.append((ranges, w, DB_CONFIG, BATCH_SIZE))
 
-    if not chunks:
+    total_assigned = sum(end - start for r, _, _, _ in chunks for start, end in r)
+    if not chunks or total_assigned == 0:
         log("Nothing to insert.")
         return
 
-    log(f"Starting {len(chunks)} workers for {total:,} rows")
+    log(f"Starting {len(chunks)} workers (partition-aligned) for {total_assigned:,} rows")
 
     start_time = datetime.now()
     done = 0
 
     with ThreadPoolExecutor(max_workers=len(chunks)) as ex:
-        futures = {ex.submit(_worker_insert, c): c[2] for c in chunks}
+        futures = {ex.submit(_worker_insert, c): c[1] for c in chunks}
         for fut in as_completed(futures):
             wid, rows, elapsed = fut.result()
             done += rows
-            pct = 100 * done / total if total else 0
-            log(f"  Worker {wid} done: {rows:,} rows ({elapsed:.1f}s) | Total: {done:,} / {total:,} ({pct:.1f}%)")
+            pct = 100 * done / total_assigned if total_assigned else 0
+            log(f"  Worker {wid} done: {rows:,} rows ({elapsed:.1f}s) | Total: {done:,} / {total_assigned:,} ({pct:.1f}%)")
 
     elapsed = datetime.now() - start_time
     rate = done / elapsed.total_seconds() if elapsed.total_seconds() else 0
