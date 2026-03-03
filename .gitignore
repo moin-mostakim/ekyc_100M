@@ -8,3 +8,4 @@ config.py
 venv/
 .venv/
 *.log
+insert_log.txt

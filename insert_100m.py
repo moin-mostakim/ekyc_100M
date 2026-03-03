@@ -1,11 +1,26 @@
 """
 Insert 100M records into bpsca_ekyc_100M tables (partitioned).
 Parallel workers, resume from last stop. NID: 10, 13, or 17 digits only.
+Logs to insert_log.txt and stdout.
 """
 
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
+
+LOG_FILE = "insert_log.txt"
+
+
+def log(msg: str):
+    """Print and append to log file with timestamp."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 try:
     import pymysql
@@ -107,7 +122,7 @@ def run_parallel(start_id: int, end_id: int, limit: int):
     end_id = min(end_id, limit + 1)
     total = end_id - start_id
     if total <= 0:
-        print("Nothing to insert (already complete).")
+        log("Nothing to insert (already complete).")
         return
 
     chunk = max(1, (end_id - start_id) // NUM_WORKERS)
@@ -120,8 +135,10 @@ def run_parallel(start_id: int, end_id: int, limit: int):
         s = e
 
     if not chunks:
-        print("Nothing to insert.")
+        log("Nothing to insert.")
         return
+
+    log(f"Starting {len(chunks)} workers for {total:,} rows")
 
     start_time = datetime.now()
     done = 0
@@ -132,10 +149,11 @@ def run_parallel(start_id: int, end_id: int, limit: int):
             wid, rows, elapsed = fut.result()
             done += rows
             pct = 100 * done / total if total else 0
-            print(f"  Worker {wid} done: {rows:,} rows ({elapsed:.1f}s) | Total: {done:,} / {total:,} ({pct:.1f}%)")
+            log(f"  Worker {wid} done: {rows:,} rows ({elapsed:.1f}s) | Total: {done:,} / {total:,} ({pct:.1f}%)")
 
     elapsed = datetime.now() - start_time
-    print(f"Done. Inserted {done:,} in {elapsed} ({done / elapsed.total_seconds():,.0f} rows/s)")
+    rate = done / elapsed.total_seconds() if elapsed.total_seconds() else 0
+    log(f"Done. Inserted {done:,} in {elapsed} ({rate:,.0f} rows/s)")
 
 
 def run_single(cnxn, cur, start_id: int, limit: int):
@@ -173,9 +191,9 @@ def run_single(cnxn, cur, start_id: int, limit: int):
         cnxn.commit()
 
         if batch_end % 100_000 == 0 or batch_end > limit:
-            print(f"  {batch_end - 1:,} rows in {datetime.now() - start_time}")
+            log(f"  {batch_end - 1:,} rows in {datetime.now() - start_time}")
 
-    print(f"Done. Total: {datetime.now() - start_time}")
+    log(f"Done. Total: {datetime.now() - start_time}")
 
 
 def main():
@@ -187,17 +205,18 @@ def main():
     cnxn.close()
 
     if start_id > limit:
-        print(f"Already complete. esignkyc max id >= {limit}. Nothing to insert.")
+        log(f"Already complete. esignkyc max id >= {limit}. Nothing to insert.")
         return
 
     remaining = limit - start_id + 1
-    print(f"Inserting from id {start_id:,} to {limit:,} ({remaining:,} records) | Workers: {NUM_WORKERS} | Batch: {BATCH_SIZE:,}")
+    log(f"Inserting from id {start_id:,} to {limit:,} ({remaining:,} records) | Workers: {NUM_WORKERS} | Batch: {BATCH_SIZE:,}")
     if start_id > 1:
-        print(f"(Resuming from previous run)")
+        log("(Resuming from previous run)")
 
     if use_parallel:
         run_parallel(start_id, limit + 1, limit)
     else:
+        log("Running in sequential mode")
         cnxn = pymysql.connect(**DB_CONFIG)
         cur = cnxn.cursor()
         try:
