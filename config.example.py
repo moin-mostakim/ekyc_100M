@@ -12,5 +12,5 @@ DB_CONFIG = {
 
 TOTAL_RECORDS = 100_000_000
 BATCH_SIZE = 5_000
-NUM_WORKERS = 4  # Parallel workers; increase carefully (lock contention risk)
+NUM_WORKERS = 1  # 1=sequential (reliable); 2+ = parallel (may deadlock with FKs)
 VALID_NID_LENGTHS = (10, 13, 17)

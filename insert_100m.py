@@ -5,6 +5,7 @@ Logs to insert_log.txt and stdout.
 """
 
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -62,6 +63,7 @@ def _worker_insert(args):
     cur = cnxn.cursor()
     cur.execute("SET SESSION innodb_lock_wait_timeout=300")
 
+    max_retries = 5
     try:
         for batch_start in range(start_id, end_id, batch_size):
             batch_end = min(batch_start + batch_size, end_id)
@@ -80,20 +82,30 @@ def _worker_insert(args):
                 esignkyc_rows.append((eid, f"User {eid}", 1, nid))
                 user_info_rows.append((eid, eid, 1, 1, nid, f"user_{eid}"))
 
-            cur.executemany(
-                "INSERT IGNORE INTO esignkyc (id, name, id_type, id_no) VALUES (%s,%s,%s,%s)",
-                esignkyc_rows,
-            )
-            cur.executemany(
-                "INSERT IGNORE INTO user_info (id, esign_id, emp_id, org_id, nid, user_name) VALUES (%s,%s,%s,%s,%s,%s)",
-                user_info_rows,
-            )
-            cur.executemany(
-                "INSERT IGNORE INTO contact_details (id, user_id, contact_type, info) VALUES (%s,%s,%s,%s)",
-                contact_rows,
-            )
-            cnxn.commit()
-            rows_done += len(ids)
+            for attempt in range(max_retries):
+                try:
+                    cur.executemany(
+                        "INSERT IGNORE INTO esignkyc (id, name, id_type, id_no) VALUES (%s,%s,%s,%s)",
+                        esignkyc_rows,
+                    )
+                    cur.executemany(
+                        "INSERT IGNORE INTO user_info (id, esign_id, emp_id, org_id, nid, user_name) VALUES (%s,%s,%s,%s,%s,%s)",
+                        user_info_rows,
+                    )
+                    cur.executemany(
+                        "INSERT IGNORE INTO contact_details (id, user_id, contact_type, info) VALUES (%s,%s,%s,%s)",
+                        contact_rows,
+                    )
+                    cnxn.commit()
+                    rows_done += len(ids)
+                    break
+                except pymysql.err.OperationalError as e:
+                    if e.args[0] in (1213, 1205):  # Deadlock, Lock wait timeout
+                        cnxn.rollback()
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5 * (attempt + 1))
+                        else:
+                            raise
 
     finally:
         cur.close()
